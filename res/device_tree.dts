@@ -1,0 +1,81 @@
+/dts-v1/;
+
+/ {
+    #address-cells = <1>;
+    #size-cells = <1>;
+    compatible = "riscv-rv32ima";
+    model = "riscv-rv32ima";
+
+    chosen {
+        bootargs = "console=ttySIF0 earlycon loglevel=6";
+        stdout-path = "/soc/serial@10000000";
+    };
+
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+        timebase-frequency = <10000000>; // 10MHz
+
+        cpu0: cpu@0 {
+            device_type = "cpu";
+            reg = <0>;
+            status = "okay";
+            compatible = "riscv";
+            riscv,isa = "rv32ima_zicsr_zifencei";
+            mmu-type = "riscv,sv32";
+
+            cpu0_intc: interrupt-controller {
+                #interrupt-cells = <1>;
+                interrupt-controller;
+                compatible = "riscv,cpu-intc";
+            };
+        };
+    };
+
+    uartclk: uartclk {
+        compatible = "fixed-clock";
+        #clock-cells = <0>;
+        clock-frequency = <3686400>; // 3.6864 MHz
+    };
+
+    memory@80000000 {
+        device_type = "memory";
+        reg = <0x80000000 0x02000000>; // RAM_BASE = 0x80000000, RAM: 32MB
+    };
+
+    soc {
+        #address-cells = <1>;
+        #size-cells = <1>;
+        compatible = "simple-bus";
+        ranges;
+
+        plic0: interrupt-controller@c000000 {
+            #interrupt-cells = <1>;
+            #address-cells = <0>;
+            compatible = "riscv,plic0";
+            reg = <0x0c000000 0x00400000>; // PLIC_BASE = 0x0c000000, PLIC_SIZE = 4MB
+            interrupt-controller;
+            interrupts-extended = <&cpu0_intc 9>; // CAUSE_IRQ_S_EXT = 0x80000009, INT_SEIP = 1 << 9
+            riscv,ndev = <16>;
+        };
+
+        uart0: serial@10000000 {
+            compatible = "sifive,uart0";
+            reg = <0x10000000 0x0100>; // UART_BASE = 0x10000000, UART_SIZE = 256
+            clocks = <&uartclk>;
+            interrupt-parent = <&plic0>;
+            interrupts = <1>;
+        };
+
+        rtc0: rtc@10100000 {
+            compatible = "google,goldfish-rtc";
+            reg = <0x10100000 0x1000>; // RTC_BASE = 0x10100000, RTC_SIZE = 4KB
+            interrupt-parent = <&plic0>;
+            interrupts = <2>;
+        };
+    };
+
+    aliases {
+        serial0 = &uart0;
+    };
+};
