@@ -16,12 +16,10 @@ constexpr uint64_t TIMEBASE_FREQ = 10'000'000;   // 10MHz
 constexpr uint32_t RAM_BASE  = 0x80000000;
 constexpr uint32_t RAM_SIZE  = 32 * 1024 * 1024; // RAM: 32MB
 constexpr uint32_t PLIC_BASE = 0x0c000000;
-constexpr uint32_t PLIC_SIZE = 0x04000000;
 constexpr uint32_t UART_BASE = 0x10000000;
 constexpr uint32_t UART_SIZE = 0x00000100;
-constexpr uint32_t RTC_BASE  = 0x10100000;
-constexpr uint32_t RTC_SIZE  = 0x00001000;
 constexpr uint32_t TLB_SIZE  = 64;
+constexpr uint32_t TLB_MASK  = 0b0011'1111;
 
 enum : uint32_t {
     PRIV_U = 0, // Privilege of User
@@ -44,8 +42,6 @@ enum : uint32_t {
     CAUSE_FETCH_ACCESS     = 1,
     CAUSE_ILLEGAL_INSN     = 2,
     CAUSE_BREAKPOINT       = 3,
-    CAUSE_LOAD_ACCESS      = 5,
-    CAUSE_STORE_ACCESS     = 7,
     CAUSE_ECALL_U          = 8,
     CAUSE_FETCH_PAGE_FAULT = 12,
     CAUSE_LOAD_PAGE_FAULT  = 13,
@@ -71,15 +67,9 @@ typedef struct {
 } csr_sstatus_t;
 
 typedef struct {
-    uint32_t ppn: 22;
-    uint32_t ASID: 9;
-    uint32_t is_sv32_mode: 1;
-} csr_satp_t;
-
-typedef struct {
     uint32_t valid: 1, readable: 1, writable: 1, executable: 1;
     uint32_t user: 1, global: 1, accessed: 1, dirty: 1;
-    uint32_t rsw: 2, ppage: 22;
+    uint32_t rsw: 2, ppn: 22;
 } page_table_entry_t;
 
 
@@ -186,9 +176,6 @@ static void uart_write(uint32_t offset, uint32_t val) {
 static jmp_buf trap_jmp_buf;
 
 static void take_trap(uint32_t cause, uint32_t value) {
-    if (!(cause & 0x80000000) && cause != CAUSE_ECALL_U && cause != CAUSE_FETCH_PAGE_FAULT && cause != CAUSE_LOAD_PAGE_FAULT && cause != CAUSE_STORE_PAGE_FAULT)
-        fprintf(stderr, "[riscv_emu TRAP] cause=0x%x, pc=0x%08x, tval=0x%08x\n", cause, CPU.pc, value);
-
     CPU.csr[CSR_SEPC] = CPU.pc;
     CPU.csr[CSR_SCAUSE] = cause;
     CPU.csr[CSR_STVAL] = value;
@@ -219,13 +206,6 @@ static void tlb_flush() {
 }
 
 
-static page_table_entry_t read_pte_from_ram(uint32_t pte_addr) {
-    page_table_entry_t pte = {};
-    if (pte_addr >= RAM_BASE && pte_addr <= RAM_BASE + RAM_SIZE - 4)
-        pte = *(page_table_entry_t*)&CPU.ram[pte_addr - RAM_BASE];
-    return pte;
-}
-
 static bool check_pte_permission(page_table_entry_t pte, uint32_t access_type) {
     if (!pte.valid) return false;
     if (CPU.priv == PRIV_U && !pte.user) return false;
@@ -234,57 +214,54 @@ static bool check_pte_permission(page_table_entry_t pte, uint32_t access_type) {
     if (access_type == ACCESS_STORE && !pte.writable) return false;
     if (access_type == ACCESS_LOAD && !pte.readable) return false;
 
-    if (!pte.accessed) return false;
-    if (access_type == ACCESS_STORE && !pte.dirty) return false;
-
     return true;
 }
 
 static uint32_t translate(uint32_t virtual_addr, uint32_t access_type) {
-    auto satp = *(csr_satp_t*)&CPU.csr[CSR_SATP];
+    struct satp_t {
+        uint32_t ppn: 22, asid: 9, is_sv32_mode: 1;
+    } satp;
+
+    satp = *(struct satp_t*)&CPU.csr[CSR_SATP];
     if (!satp.is_sv32_mode)
         return virtual_addr;
 
     uint32_t vpage = virtual_addr >> 12;    // vaddr[31:12](20)
     uint32_t offset = virtual_addr & 0xfff; // vaddr[11:0](12)
 
-    auto tlb_entry = &TLB[CPU.priv][access_type][vpage & (TLB_SIZE - 1)];
+    auto tlb_entry = &TLB[CPU.priv][access_type][vpage & TLB_MASK];
     if (tlb_entry->virtual_page == vpage)
         return (tlb_entry->physical_page << 12) | offset;
 
     uint32_t vpage1 = vpage >> 10;   // vaddr[31:22](10)
-    uint32_t vpage0 = vpage & 0x3ff; // vaddr[21:12](10)
+    uint32_t vpage2 = vpage & 0x3ff; // vaddr[21:12](10)
 
     uint32_t vtable_addr = satp.ppn << 12;
-    page_table_entry_t pte = read_pte_from_ram(vtable_addr + vpage1 * 4);
+    auto pte = *(page_table_entry_t*)&CPU.ram[vtable_addr + vpage1 * 4 - RAM_BASE];
 
-    uint32_t ppage = (pte.ppage & ~0x3ff) | vpage0;
+    uint32_t physical_page;
 
-    if (pte.valid && !pte.readable && !pte.writable && !pte.executable) {
-        uint32_t level0_table_addr = pte.ppage << 12;
-        pte = read_pte_from_ram(level0_table_addr + vpage0 * 4);
-        ppage = pte.ppage;
+    if (pte.valid && !pte.readable && !pte.writable && !pte.executable) { // 4KB Page (2 level)
+        uint32_t next_vtable_addr = pte.ppn << 12;
+        pte = *(page_table_entry_t*)&CPU.ram[next_vtable_addr + vpage2 * 4 - RAM_BASE];
+        physical_page = pte.ppn;
     }
+    else physical_page = pte.ppn | vpage2; // 4MB Page (1 level)
 
-    if (!check_pte_permission(pte, access_type)) {
-        uint32_t cause = access_type == ACCESS_FETCH ? CAUSE_FETCH_PAGE_FAULT : access_type == ACCESS_LOAD ? CAUSE_LOAD_PAGE_FAULT : CAUSE_STORE_PAGE_FAULT;
-        trap_throw(cause, virtual_addr);
-    }
+    if (!check_pte_permission(pte, access_type))
+        switch (access_type) {
+            case ACCESS_FETCH: trap_throw(CAUSE_FETCH_PAGE_FAULT, virtual_addr);
+            case ACCESS_LOAD: trap_throw(CAUSE_LOAD_PAGE_FAULT, virtual_addr);
+            case ACCESS_STORE: default: trap_throw(CAUSE_STORE_PAGE_FAULT, virtual_addr);
+        }
 
     tlb_entry->virtual_page = vpage;
-    tlb_entry->physical_page = ppage;
-    return (ppage << 12) | offset;
+    tlb_entry->physical_page = physical_page;
+    return (physical_page << 12) | offset;
 }
 
 
 static uint32_t vmem_read(uint32_t vaddr, uint32_t size, uint32_t access_type) {
-    if unlikely((vaddr & 0xfff) + size > 0x1000) { // Cross page access
-        uint32_t val = 0;
-        for (uint32_t i = 0; i < size; i++)
-            val |= vmem_read(vaddr + i, 1, access_type) << (i * 8);
-        return val;
-    }
-
     uint32_t paddr = translate(vaddr, access_type);
 
     if likely(paddr - RAM_BASE <= RAM_SIZE - size) {
@@ -299,38 +276,18 @@ static uint32_t vmem_read(uint32_t vaddr, uint32_t size, uint32_t access_type) {
     else if (paddr >= UART_BASE && paddr < UART_BASE + UART_SIZE)
         return uart_read(paddr - UART_BASE);
 
-    else if (paddr >= PLIC_BASE && paddr < PLIC_BASE + PLIC_SIZE) {
-        uint32_t offset = paddr - PLIC_BASE;
-        if (offset == 0x200004 || offset == 0x201004) // Hart 0 S-mode or Hart 0 M-mode
-            return uart_irq_raised();
-    }
-
-    else if (paddr >= RTC_BASE && paddr < RTC_BASE + RTC_SIZE) {
-        uint32_t offset = paddr - RTC_BASE;
-        if (offset == 0) return (time(nullptr) * 1'000'000'000ull) & 0xffffffff;
-        if (offset == 4) return (time(nullptr) * 1'000'000'000ull) >> 32;
-    }
-
-    else {
-        uint32_t cause = access_type == ACCESS_FETCH ? CAUSE_FETCH_ACCESS : access_type == ACCESS_STORE ? CAUSE_STORE_ACCESS : CAUSE_LOAD_ACCESS;
-        trap_throw(cause, vaddr);
-    }
+    if (paddr == PLIC_BASE + 0x200004 || paddr == PLIC_BASE + 0x201004) // Hart 0 S-mode or Hart 0 M-mode
+        return uart_irq_raised();
 
     return 0;
 }
 
 
 static void vmem_write(uint32_t vaddr, uint32_t size, uint32_t val) {
-    if unlikely((vaddr & 0xfff) + size > 0x1000) { // Cross page access
-        for (uint32_t i = 0; i < size; i++)
-            vmem_write(vaddr + i, 1, (val >> (i * 8)) & 0xff);
-        return;
-    }
-
     uint32_t paddr = translate(vaddr, ACCESS_STORE);
 
     if likely(paddr - RAM_BASE <= RAM_SIZE - size) {
-        uint8_t* p = &CPU.ram[paddr - RAM_BASE]; 
+        uint8_t* p = &CPU.ram[paddr - RAM_BASE];
         switch (size) {
             case 4: *(uint32_t*)p = val; break;
             case 2: *(uint16_t*)p = val; break;
@@ -340,10 +297,6 @@ static void vmem_write(uint32_t vaddr, uint32_t size, uint32_t val) {
 
     else if (paddr >= UART_BASE && paddr < UART_BASE + UART_SIZE)
         uart_write(paddr - UART_BASE, val);
-
-    else if (paddr >= PLIC_BASE && paddr < PLIC_BASE + PLIC_SIZE) return;
-    else if (paddr >= RTC_BASE && paddr < RTC_BASE + RTC_SIZE) return;
-    else trap_throw(CAUSE_STORE_ACCESS, vaddr);
 }
 
 
@@ -369,7 +322,6 @@ static void handle_sbi() {
     switch (eid) {
         case 0x54494D45: // TIME
             CPU.timer_interrupt_mtime = ((uint64_t)a1 << 32) | a0;
-            set_bit(CPU.csr[CSR_SIP], INT_STIP, 0);
             break;
 
         case 0x8: // Legacy Shutdown
@@ -400,12 +352,11 @@ static uint32_t csr_read(uint32_t csr) {
 }
 
 static void csr_write(uint32_t csr, uint32_t val) {
-    if (csr >> 10 == 0b11) trap_throw(CAUSE_ILLEGAL_INSN, CPU.pc);
     if (csr == CSR_SATP) tlb_flush();
     CPU.csr[csr] = val;
 }
 
-static void handle_system_or_csr_ins(uint32_t ins, uint32_t rd, uint32_t funct3, uint32_t rs1) {
+static void handle_system_csr_ins(uint32_t ins, uint32_t rd, uint32_t funct3, uint32_t rs1) {
     if (funct3 == 0) { // SYSTEM
         uint32_t funct12 = ins >> 20;
         switch (funct12) {
@@ -424,7 +375,6 @@ static void handle_system_or_csr_ins(uint32_t ins, uint32_t rd, uint32_t funct3,
                 sstatus->previous_priv = PRIV_U;
                 sstatus->previous_interrupt_enable = true;
 
-                CPU.lr_addr = -1u;
                 CPU.pc = CPU.csr[CSR_SEPC];
                 return;
             }
@@ -448,16 +398,16 @@ static void handle_system_or_csr_ins(uint32_t ins, uint32_t rd, uint32_t funct3,
 
     else { // CSR
         uint32_t csr = ins >> 20;
-        uint32_t val = csr_read(csr);
+        uint32_t old_val = csr_read(csr);
         uint32_t src = funct3 & 0b100 ? rs1 : CPU.regs[rs1];
 
         switch (funct3 & 0b011) {
             case 1: csr_write(csr, src); break; // CSRRW / CSRRWI
-            case 2: if (rs1 != 0) csr_write(csr, val | src); break;  // CSRRS / CSRRSI
-            case 3: if (rs1 != 0) csr_write(csr, val & ~src); break; // CSRRC / CSRRCI
+            case 2: csr_write(csr, old_val | src); break;  // CSRRS / CSRRSI
+            case 3: csr_write(csr, old_val & ~src); break; // CSRRC / CSRRCI
         }
 
-        CPU.regs[rd] = val;
+        CPU.regs[rd] = old_val;
     }
 
     CPU.pc += 4;
@@ -512,7 +462,7 @@ static void cpu_step() {
             uint32_t r1 = CPU.regs[rs1];
             uint32_t r2 = CPU.regs[rs2];
 
-            bool cond;
+            bool cond = false;
             switch (funct3) {
                 case 0: cond = r1 == r2; break;
                 case 1: cond = r1 != r2; break;
@@ -520,7 +470,6 @@ static void cpu_step() {
                 case 5: cond = (int32_t)r1 >= (int32_t)r2; break;
                 case 6: cond = r1 < r2; break;
                 case 7: cond = r1 >= r2; break;
-                default: trap_throw(CAUSE_ILLEGAL_INSN, ins);
             }
 
             CPU.pc += cond ? imm_b : 4;
@@ -641,7 +590,6 @@ static void cpu_step() {
                     case 0x14: new_val = (int32_t)old_val > (int32_t)r2 ? old_val : r2; break;
                     case 0x18: new_val = old_val < r2 ? old_val : r2; break;
                     case 0x1c: new_val = old_val > r2 ? old_val : r2; break;
-                    default: trap_throw(CAUSE_ILLEGAL_INSN, ins);
                 }
                 vmem_write(r1, 4, new_val);
                 CPU.regs[rd] = old_val;
@@ -652,32 +600,23 @@ static void cpu_step() {
         }
 
         case 0x73: // SYSTEM / CSR
-            handle_system_or_csr_ins(ins, rd, funct3, rs1);
-            break;
-
-        default:
-            trap_throw(CAUSE_ILLEGAL_INSN, ins);
+            handle_system_csr_ins(ins, rd, funct3, rs1);
             break;
     }
 }
 
+
 static bool load_file(const char *path, uint32_t offset) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
-    fseek(f, 0, SEEK_END);
-    auto size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    bool ok = size >= 0 && offset + size <= RAM_SIZE && (fread(CPU.ram + offset, 1, size, f) == (unsigned)size);
+    size_t n = fread(CPU.ram + offset, 1, RAM_SIZE - offset, f);
     fclose(f);
-    return ok;
+    return n > 0;
 }
 
 
 int main(int argc, char* argv[]) {
-    if (argc < 3)
-        return fprintf(stderr, "Usage: %s <Linux-Image> <device_tree.dtb>\n", argv[0]);
-
-    if (!load_file(argv[1], 0) || !load_file(argv[2], RAM_SIZE - 0x100000))
+    if (!load_file("linux.image", 0) || !load_file("device_tree.dtb", RAM_SIZE - 0x100000))
         return fprintf(stderr, "Unable to load the kernel image or device tree file(.dtb).\n");
 
     enable_raw_mode();

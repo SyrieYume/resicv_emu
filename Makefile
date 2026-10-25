@@ -51,7 +51,7 @@ $(SYSROOT)/.installed: $(THIRD_PARTY)/$(MUSL_VER)/.extracted | build
 	LIBGCC=$$(riscv64-elf-gcc -march=rv32im -mabi=ilp32 -print-libgcc-file-name) && \
 	LIBGCC_DIR=$$(dirname "$$LIBGCC") && \
 	cd $(THIRD_PARTY)/$(MUSL_VER) && \
-	CC="riscv64-linux-gnu-gcc -march=rv32ima -mabi=ilp32" \
+	CC="riscv64-linux-gnu-gcc -march=rv32ima -mabi=ilp32 -mstrict-align" \
 	CROSS_COMPILE="riscv64-linux-gnu-" \
 	LIBCC="$$LIBGCC" \
 	./configure --target=riscv32-linux-musl --prefix=$(SYSROOT) --disable-shared --enable-wrapper=gcc && \
@@ -88,7 +88,7 @@ build/busybox: $(THIRD_PARTY)/$(BUSYBOX_VER)/.extracted res/busybox.config.toml 
 		ARCH=riscv \
 		CROSS_COMPILE="riscv64-linux-gnu-" \
 		HOSTCC=gcc \
-		CC="clang --target=riscv32-unknown-linux-musl -march=rv32ima -mabi=ilp32 --sysroot=$(SYSROOT) -fuse-ld=lld --rtlib=libgcc --unwindlib=none -Os -Qunused-arguments" \
+		CC="clang --target=riscv32-unknown-linux-musl -march=rv32ima -mabi=ilp32 -mstrict-align --sysroot=$(SYSROOT) -fuse-ld=lld --rtlib=libgcc --unwindlib=none -Os -Qunused-arguments" \
 		busybox
 	riscv64-linux-gnu-strip -s $(THIRD_PARTY)/$(BUSYBOX_VER)/busybox -o $@
 
@@ -98,6 +98,7 @@ build/linux.image: $(THIRD_PARTY)/$(LINUX_VER)/.extracted res/linux.config.toml 
 	KBUILD_BUILD_HOST="hallo" \
 	KBUILD_BUILD_TIMESTAMP=" " \
 	KBUILD_BUILD_VERSION="1" \
+	KCFLAGS="-mstrict-align" \
 	$(MAKE) -C $(THIRD_PARTY)/$(LINUX_VER) ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j$$(nproc) Image
 	cp $(THIRD_PARTY)/$(LINUX_VER)/arch/riscv/boot/Image $@
 

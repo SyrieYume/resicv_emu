@@ -66,13 +66,6 @@
             interrupt-parent = <&plic0>;
             interrupts = <1>;
         };
-
-        rtc0: rtc@10100000 {
-            compatible = "google,goldfish-rtc";
-            reg = <0x10100000 0x1000>; // RTC_BASE = 0x10100000, RTC_SIZE = 4KB
-            interrupt-parent = <&plic0>;
-            interrupts = <2>;
-        };
     };
 
     aliases {
